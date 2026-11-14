@@ -1,32 +1,51 @@
-# btc-cent-forecast-01 — v1: damped-momentum forecaster (Python 3.13, stdlib only)
+# btc-cent-forecast-01 — v2: median mean-reversion forecaster (Python 3.13, stdlib only)
 #
-# Formula (v1, deliberately simple — to be tuned against the practice cases
-# in Stage 2 with rolling backtests inside each case's own 72h window):
+# Formula (v2 — the v1 momentum term is GONE; see the evidence below):
 #
-#   Let P0 be the last close (the checkpoint close) and P(-k) the close k
-#   minutes earlier.  Work in log prices so the forecast stays positive.
+#   Let P0 be the last close (the checkpoint close) and M the median of all
+#   closes in the case (4,320 values, 72 hours).  Work in log prices.
 #
-#   1. Short-window drift.  r60 = ln(P0 / P(-60)) and r240 = ln(P0 / P(-240))
-#      are the log-returns over the last hour and the last four hours.
-#      Scale each to a 240-minute horizon and blend them:
-#          drift240 = 0.6 * (4 * r60) + 0.4 * r240
-#      (the 1h return gets the bigger weight: it is the freshest signal, but
-#      scaling it x4 also scales its noise, which is why step 2 shrinks it.)
+#       dev = ln(P0 / M)
+#       forecast = P0 * exp(-0.30 * dev)   if |dev| > 0.015
+#       forecast = P0                      otherwise
 #
-#   2. Hard shrinkage toward persistence.  BTC's 4h drift is mostly noise and
-#      persistence (forecast = P0) is a strong baseline (practice MAE
-#      44,521.58 cents).  Keep only 8% of the estimated drift:
-#          drift_term = 0.08 * drift240
+#   In words: when the price sits more than 1.5% away from its 72-hour
+#   median, move 30% of the way (in log terms) back toward that median;
+#   otherwise forecast persistence (no move).  The result is clamped to the
+#   scorer's (0, 10,000,000) range and rounded to the 5-decimal price grid.
 #
-#   3. Extreme-deviation mean reversion.  Let M be the median of all 4,320
-#      closes (72h) and dev = ln(P0 / M).  Only when the price sits more than
-#      2% away from its 72h median do we pull a little back toward it:
-#          pull = -0.05 * dev   if |dev| > 0.02, else 0
-#      (5% of the deviation — a nudge, not a snap-back; ordinary days are
-#      untouched so the forecaster stays close to persistence.)
-#
-#   4. Forecast:  P = P0 * exp(drift_term + pull), clamped to the scorer's
-#      (0, 10,000,000) range and rounded to the price grid's 5 decimals.
+# Why v2 drops v1's momentum (evidence from the Stage 2 rolling backtest,
+# backtest.py — NOT shipped in the repo):
+#   * Harness: for each practice case p00-p05, origins every 15 min from
+#     minute 240 to 4065 (target origin+240 stays inside the case), 256
+#     origins per case, 1,536 samples total. The harness was validated to
+#     reproduce main.py v1's forecasts on the six full cases exactly.
+#   * v1 on that backtest scored 35,091c — WORSE than pure persistence
+#     (34,815c). Its 6-case practice win (39,184c vs 44,076c) was luck
+#     concentrated in p02/p03, not a real edge: momentum hurts on average.
+#   * Grid over shrink {0.04..0.12}, 1h/4h blend {0.5,0.6,0.7}, pull
+#     {0.03,0.05,0.08}, threshold {0.01,0.02,0.03} (135 configs) plus a
+#     120/480-min drift variant: smaller shrink was monotonically better,
+#     stronger pull monotonically better. Probing past the grid edge
+#     (pull 0.10/0.12/0.15/0.20/0.25/0.30/0.40, threshold 0.015/0.02,
+#     median windows 24h/48h/72h) found a genuine interior peak at
+#     pull 0.30, threshold 0.015, full-history median — pull 0.40 is worse
+#     again (32,516c) and the pure-median forecast is terrible (70,334c),
+#     so 0.30 is a peak, not a runaway edge.
+#   * v2 backtest MAE: 31,915c pooled (vs persistence 34,815c, v1 35,091c);
+#     late origins only (i >= 2880, 48h+ of history, closest to the real
+#     72h case shape): 36,293c (vs persistence 39,820c, v1 40,212c);
+#     beats persistence on ALL 6 case-windows (26,641 / 27,164 / 29,171 /
+#     34,045 / 36,810 / 37,662c) and in both split halves.
+#   * A token drift term (shrink 0.02) adds nothing at pull 0.30
+#     (31,941c pooled), so it was dropped: fewer knobs, less overfit.
+#   * Practice 6-case MAE (p05 via a Coinbase close proxy, approx):
+#     v2 38,893c vs v1 39,184c vs persistence 44,076c (official sealed
+#     persistence: 44,521.58c). The 6-case number is noisy (SE ~7,000c);
+#     the backtest is the ranking evidence, the practice number is a check.
+#   * Known risk: in a hard one-way trend (waterfall) the median lags and
+#     the pull bets against the trend; the backtest's volatile late half
+#     still favoured it, but the final window (15-17 Nov) is a new regime.
 #
 # Deterministic: no randomness, no time, no network; the same case file
 # always yields the same bytes.  Reads every *.in file in the input
@@ -42,16 +61,25 @@ from pathlib import Path
 MIN_PRICE = 0.00001
 MAX_PRICE = 9_999_999.99999
 
-# v1 constants (see header comment for the reasoning).
-DRIFT_SHRINK = 0.08        # fraction of the estimated 240-min drift kept
-SHORT_WEIGHT = 0.6         # weight on the scaled 1h return vs the 4h return
-REVERT_THRESHOLD = 0.02    # |ln(P0 / median72)| above which we pull back
-REVERT_STRENGTH = 0.05     # fraction of the deviation pulled back
+# v2 constants (tuned by the Stage 2 rolling backtest; see header).
+REVERT_THRESHOLD = 0.015   # |ln(P0 / median)| above which we pull back
+REVERT_STRENGTH = 0.30     # fraction of the deviation pulled back (log terms)
 
 
 def price5(x: float) -> float:
     """Clamp to the scorer's range and round to the 5-decimal price grid."""
     return round(min(MAX_PRICE, max(MIN_PRICE, x)) * 1e5) / 1e5
+
+
+def median_of(prices) -> float:
+    """Median of the closes (finite, positive only)."""
+    ordered = sorted(p for p in prices if math.isfinite(p) and p > 0)
+    if not ordered:
+        raise ValueError("market has no usable prices")
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return 0.5 * (ordered[mid - 1] + ordered[mid])
 
 
 def forecast(prices) -> float:
@@ -62,37 +90,13 @@ def forecast(prices) -> float:
     if not math.isfinite(p0) or p0 <= 0:
         raise ValueError("last price is not a finite positive number")
 
-    n = len(prices)
-
-    def log_return(k: int) -> float:
-        """ln(P0 / P(-k)); 0.0 when the window is unavailable or invalid."""
-        if n <= k:
-            return 0.0
-        pk = float(prices[-1 - k])
-        if not math.isfinite(pk) or pk <= 0:
-            return 0.0
-        return math.log(p0 / pk)
-
-    # 1-2. Damped momentum: blend the 1h and 4h log-returns, scale to the
-    # 240-minute horizon, then shrink hard toward zero (persistence).
-    r60 = log_return(60)
-    r240 = log_return(240)
-    drift240 = SHORT_WEIGHT * (4.0 * r60) + (1.0 - SHORT_WEIGHT) * r240
-    drift_term = DRIFT_SHRINK * drift240
-
-    # 3. Mean reversion, only on extreme deviation from the 72h median.
-    pull = 0.0
-    if n >= 100:
-        ordered = sorted(float(p) for p in prices if math.isfinite(p) and p > 0)
-        if ordered:
-            mid = len(ordered) // 2
-            median = ordered[mid] if len(ordered) % 2 else 0.5 * (ordered[mid - 1] + ordered[mid])
-            dev = math.log(p0 / median)
-            if abs(dev) > REVERT_THRESHOLD:
-                pull = -REVERT_STRENGTH * dev
-
-    # 4. Combine and clamp.
-    return price5(p0 * math.exp(drift_term + pull))
+    # Mean reversion toward the full-history median, only on a real stretch.
+    # Short histories (<100 closes) skip the pull and stay at persistence.
+    if len(prices) >= 100:
+        dev = math.log(p0 / median_of(prices))
+        if abs(dev) > REVERT_THRESHOLD:
+            return price5(p0 * math.exp(-REVERT_STRENGTH * dev))
+    return price5(p0)
 
 
 def main() -> None:
